@@ -7,6 +7,7 @@ import tempfile
 import threading
 from collections.abc import Generator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1071,23 +1072,39 @@ def _make_aiohttp_put_session(status: int = 200, body_text: str = ""):
 
 
 @pytest.mark.asyncio
-async def test_upload_data_uploads_once_on_success():
+@pytest.mark.parametrize("status", [200, 201, 202, 204])
+@pytest.mark.parametrize("from_file", [False, True])
+async def test_upload_data_uploads_once_on_success(
+    status: int, from_file: bool, tmp_path: Path
+):
     """A successful upload must not be retried (regression guard)."""
-    session = _make_aiohttp_put_session(status=200)
-    with patch(
-        "vllm.entrypoints.launchers.run_batch.aiohttp.ClientSession",
-        return_value=session,
+    session = _make_aiohttp_put_session(status=status)
+    payload = "payload"
+    if from_file:
+        output_file = tmp_path / "output.jsonl"
+        output_file.write_text(payload)
+        payload = str(output_file)
+    with (
+        patch(
+            "vllm.entrypoints.launchers.run_batch.aiohttp.ClientSession",
+            return_value=session,
+        ),
+        patch(
+            "vllm.entrypoints.launchers.run_batch.asyncio.sleep", AsyncMock()
+        ) as sleep,
     ):
         await upload_data(
-            "https://example.com/output.jsonl", "payload", from_file=False
+            "https://example.com/output.jsonl", payload, from_file=from_file
         )
     assert session.put.call_count == 1
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_upload_data_error_includes_awaited_response_body():
+@pytest.mark.parametrize("status", [300, 400, 500])
+async def test_upload_data_error_includes_awaited_response_body(status: int):
     """A failed upload must surface the awaited response body, not a coroutine."""
-    session = _make_aiohttp_put_session(status=500, body_text="server-error-detail")
+    session = _make_aiohttp_put_session(status=status, body_text="server-error-detail")
     with (
         patch(
             "vllm.entrypoints.launchers.run_batch.aiohttp.ClientSession",
@@ -1105,3 +1122,4 @@ async def test_upload_data_error_includes_awaited_response_body():
     message = str(exc_info.value)
     assert "server-error-detail" in message
     assert "coroutine" not in message
+    assert session.put.call_count == 5
