@@ -13,6 +13,8 @@
 
 use std::time::Instant;
 
+use thiserror_ext::AsReport;
+
 use crate::backends::{RequestFuncInput, RequestFuncOutput, build_headers};
 use crate::cli::BackendKind;
 use crate::error::Result;
@@ -80,13 +82,20 @@ impl PoolingBackend {
         };
 
         if response.status().is_success() {
+            let body = match response.bytes().await {
+                Ok(body) => body,
+                Err(e) => {
+                    output.error = format!("Response body failed: {}", e.as_report());
+                    return Ok(output);
+                }
+            };
             let latency = st.elapsed().as_secs_f64();
             output.latency = latency;
             output.ttft = latency;
             output.success = true;
 
             // Parse usage from response; keep client-side prompt_len as fallback.
-            match response.json::<PoolingResponse>().await {
+            match serde_json::from_slice::<PoolingResponse>(&body) {
                 Ok(data) => {
                     if let Some(usage) = data.usage
                         && let Some(tokens) = usage.prompt_tokens
@@ -95,7 +104,7 @@ impl PoolingBackend {
                     }
                 }
                 Err(_) => {
-                    // Response parsed but no usage — keep client-side prompt_len
+                    // Non-JSON or missing usage — keep client-side prompt_len.
                 }
             }
         } else {
@@ -279,11 +288,132 @@ fn push_json_escaped_str(buf: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
 
     use super::*;
 
     fn list(items: &[&str]) -> Option<Arc<[Arc<str>]>> {
         Some(items.iter().map(|s| Arc::from(*s)).collect())
+    }
+
+    const POOLING_KINDS: [BackendKind; 4] = [
+        BackendKind::OpenaiEmbeddings,
+        BackendKind::OpenaiEmbeddingsChat,
+        BackendKind::VllmPooling,
+        BackendKind::VllmRerank,
+    ];
+
+    async fn send_response(
+        kind: BackendKind,
+        body: &'static [u8],
+        content_length: usize,
+        body_delay: Duration,
+    ) -> (RequestFuncOutput, Duration) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut request_length = 0;
+            loop {
+                let mut line = String::new();
+                assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    request_length = value.trim().parse().unwrap();
+                }
+            }
+            socket.read_exact(&mut vec![0; request_length]).await.unwrap();
+            let socket = socket.get_mut();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {content_length}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let headers_sent = Instant::now();
+            if !body_delay.is_zero() {
+                // The backend exposes no notification that headers were received.
+                tokio::time::sleep(body_delay).await;
+            }
+            let body_wait = headers_sent.elapsed();
+            socket.write_all(body).await.unwrap();
+            socket.shutdown().await.unwrap();
+            body_wait
+        });
+        let input = RequestFuncInput {
+            api_url: format!("http://{addr}/pooling"),
+            model: "test-model".into(),
+            prompt_len: 7,
+            prompt_list: list(&["query", "document"]),
+            ..Default::default()
+        };
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let output = PoolingBackend { kind }.send_request(&input, &client).await.unwrap();
+        (output, server.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_pooling_latency_includes_response_body() {
+        let body = br#"{"usage":{"prompt_tokens":11}}"#;
+        for kind in POOLING_KINDS {
+            let (output, body_wait) =
+                send_response(kind, body, body.len(), Duration::from_millis(100)).await;
+            assert!(output.success, "{kind:?}: {}", output.error);
+            assert!(
+                output.latency >= body_wait.as_secs_f64(),
+                "{kind:?}: latency {} excludes body wait {body_wait:?}",
+                output.latency
+            );
+            assert_eq!(output.ttft, output.latency);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pooling_rejects_truncated_response_body() {
+        let body = br#"{"usage":{"prompt_tokens":11}}"#;
+        for kind in POOLING_KINDS {
+            let (output, _) = send_response(kind, body, body.len() + 1, Duration::ZERO).await;
+            assert!(
+                !output.success,
+                "{kind:?}: truncated body counted as success"
+            );
+            assert!(!output.error.is_empty(), "{kind:?}: missing body error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pooling_preserves_prompt_fallback_without_usage() {
+        for body in [b"\x00\x00\x80\x3f".as_slice(), b"{}"] {
+            let (output, _) =
+                send_response(BackendKind::VllmPooling, body, body.len(), Duration::ZERO).await;
+            assert!(output.success, "{}", output.error);
+            assert_eq!(output.prompt_len, 7);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pooling_preserves_json_usage() {
+        let body = br#"{"usage":{"prompt_tokens":11}}"#;
+        for kind in POOLING_KINDS {
+            let (output, _) = send_response(kind, body, body.len(), Duration::ZERO).await;
+            assert!(output.success, "{kind:?}: {}", output.error);
+            assert_eq!(output.prompt_len, 11, "{kind:?}");
+        }
     }
 
     #[test]
